@@ -48,7 +48,8 @@
 #include "SDL_fbmatrox.h"
 #include "SDL_fbriva.h"
 
-/*#define FBCON_DEBUG*/
+//#define FBCON_DEBUG
+#define TRIPLEBUF_WITHOUT_THREADS
 
 #if defined(__i386__) && defined(HAVE_SYS_IO_H) && defined(FB_TYPE_VGA_PLANES)
 #define VGA16_FBCON_SUPPORT
@@ -154,9 +155,12 @@ static void FB_UnlockHWSurface(_THIS, SDL_Surface *surface);
 static void FB_FreeHWSurface(_THIS, SDL_Surface *surface);
 static void FB_WaitVBL(_THIS);
 static void FB_WaitIdle(_THIS);
+
 static int FB_FlipHWSurface(_THIS, SDL_Surface *surface);
 #if !SDL_THREADS_DISABLED
+#if ! defined(TRIPLEBUF_WITHOUT_THREADS)
 static int FB_TripleBufferingThread(void *d);
+#endif //! defined(TRIPLEBUF_WITHOUT_THREADS)
 static void FB_TripleBufferInit(_THIS);
 static void FB_TripleBufferStop(_THIS);
 static void FB_TripleBufferQuit(_THIS);
@@ -1020,6 +1024,12 @@ static SDL_Surface *FB_SetVideoMode(_THIS, SDL_Surface *current,
 	char *surfaces_mem;
 	int surfaces_len;
 
+#define FUNKEY_FORCE_TRIPLE_BUFFERING
+#ifdef FUNKEY_FORCE_TRIPLE_BUFFERING
+	flags |= SDL_TRIPLEBUF;
+	flags |= SDL_DOUBLEBUF;
+#endif
+
 	/* Set the terminal into graphics mode */
 	if ( FB_EnterGraphicsMode(this) < 0 ) {
 		return(NULL);
@@ -1051,7 +1061,8 @@ static SDL_Surface *FB_SetVideoMode(_THIS, SDL_Surface *current,
 	}
 
 	if ( (vinfo.xres != width) || (vinfo.yres != height) ||
-	     (vinfo.bits_per_pixel != bpp) || (flags & SDL_DOUBLEBUF) ) {
+	     (vinfo.bits_per_pixel != bpp) || (flags & SDL_DOUBLEBUF) || 
+	     (flags & SDL_TRIPLEBUF) ) {
 		vinfo.activate = FB_ACTIVATE_NOW;
 		vinfo.accel_flags = 0;
 		vinfo.bits_per_pixel = bpp;
@@ -1198,6 +1209,8 @@ static SDL_Surface *FB_SetVideoMode(_THIS, SDL_Surface *current,
 		current->flags |= SDL_TRIPLEBUF;
 		current_page = 0;
 		new_page = 2;
+
+#if ! defined(TRIPLEBUF_WITHOUT_THREADS)
 		triplebuf_thread_stop = 0;
 
 		SDL_LockMutex(triplebuf_mutex);
@@ -1206,6 +1219,8 @@ static SDL_Surface *FB_SetVideoMode(_THIS, SDL_Surface *current,
 		/* Wait until the triplebuf thread is ready */
 		SDL_CondWait(triplebuf_cond, triplebuf_mutex);
 		SDL_UnlockMutex(triplebuf_mutex);
+#endif //! defined(TRIPLEBUF_WITHOUT_THREADS)
+
 	}
 #endif
 
@@ -1544,6 +1559,7 @@ static int FB_FlipHWSurface(_THIS, SDL_Surface *surface)
 
 	if ( (surface->flags & SDL_TRIPLEBUF) == SDL_TRIPLEBUF ) {
 #if !SDL_THREADS_DISABLED
+	#if ! defined(TRIPLEBUF_WITHOUT_THREADS)
 		unsigned int page;
 
 		/* Flip the two back buffers */
@@ -1555,6 +1571,21 @@ static int FB_FlipHWSurface(_THIS, SDL_Surface *surface)
 		surface->pixels = flip_address[flip_page];
 		SDL_CondSignal(triplebuf_cond);
 		SDL_UnlockMutex(triplebuf_mutex);
+	#else // defined(TRIPLEBUF_WITHOUT_THREADS)
+		/* Wait for vertical retrace and then flip display */
+		cache_vinfo.yoffset = current_page * cache_vinfo.yres;
+
+		wait_vbl(this);
+
+		if ( ioctl(console_fd, FBIOPAN_DISPLAY, &cache_vinfo) < 0 ) {
+			SDL_SetError("ioctl(FBIOPAN_DISPLAY) failed");
+			return(-1);
+		}
+
+		//printf("%s l.%d, current page: %d\n", __func__, __LINE__, current_page);
+		current_page = (current_page+1)%3;
+		surface->pixels = flip_address[current_page];
+	#endif //! defined(TRIPLEBUF_WITHOUT_THREADS)
 #endif
 	} else {
 		/* Wait for vertical retrace and then flip display */
