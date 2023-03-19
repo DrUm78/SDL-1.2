@@ -3033,7 +3033,7 @@ static void BlitNtoNPixelAlpha(SDL_BlitInfo *info)
 		unsigned dA;
 		DISEMBLE_RGBA(src, srcbpp, srcfmt, Pixel, sR, sG, sB, sA);
 		sA=(sA*alpha_multiply)>>8;
-		sA=GFX_ALPHA_ADJUST_ARRAY[sA & 255];
+		//sA=GFX_ALPHA_ADJUST_ARRAY[sA & 255];
 		if(sA) {
 		  DISEMBLE_RGBA(dst, dstbpp, dstfmt, Pixel, dR, dG, dB, dA);
 		  ALPHA_BLEND(sR, sG, sB, sA, dR, dG, dB);
