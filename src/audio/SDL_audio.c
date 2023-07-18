@@ -118,6 +118,11 @@ SDL_AudioDevice *current_audio = NULL;
 int SDL_AudioInit(const char *driver_name);
 void SDL_AudioQuit(void);
 
+// Additional variables for RG Nano
+#include	<unistd.h>
+uint32_t	quit_audio = 0;
+uint32_t	now_USB = 0;
+
 /* The general mixing thread function */
 int SDLCALL SDL_RunAudio(void *audiop)
 {
@@ -150,61 +155,95 @@ int SDLCALL SDL_RunAudio(void *audiop)
 		stream_len = audio->spec.size;
 	}
 
-	/* Loop, filling the audio buffers */
+	// RG Nano
+	// setup 1sec counter
+	uint32_t counter_1sec = audio->spec.freq / audio->spec.samples;
+	if (counter_1sec == 0) counter_1sec = 1;
+	uint32_t counter = counter_1sec;
+
 	while ( audio->enabled ) {
+		/* Loop, filling the audio buffers */
+		while ( audio->enabled ) {
 
-		/* Fill the current buffer with sound */
-		if ( audio->convert.needed ) {
-			if ( audio->convert.buf ) {
-				stream = audio->convert.buf;
+			/* Fill the current buffer with sound */
+			if ( audio->convert.needed ) {
+				if ( audio->convert.buf ) {
+					stream = audio->convert.buf;
+				} else {
+					continue;
+				}
 			} else {
-				continue;
+				stream = audio->GetAudioBuf(audio);
+				if ( stream == NULL ) {
+					stream = audio->fake_stream;
+				}
 			}
-		} else {
-			stream = audio->GetAudioBuf(audio);
-			if ( stream == NULL ) {
-				stream = audio->fake_stream;
+
+			SDL_memset(stream, silence, stream_len);
+
+			if ( ! audio->paused ) {
+				SDL_mutexP(audio->mixer_lock);
+				(*fill)(udata, stream, stream_len);
+				SDL_mutexV(audio->mixer_lock);
 			}
-		}
 
-		SDL_memset(stream, silence, stream_len);
-
-		if ( ! audio->paused ) {
-			SDL_mutexP(audio->mixer_lock);
-			(*fill)(udata, stream, stream_len);
-			SDL_mutexV(audio->mixer_lock);
-		}
-
-		/* Convert the audio if necessary */
-		if ( audio->convert.needed ) {
-			SDL_ConvertAudio(&audio->convert);
-			stream = audio->GetAudioBuf(audio);
-			if ( stream == NULL ) {
-				stream = audio->fake_stream;
+			/* Convert the audio if necessary */
+			if ( audio->convert.needed ) {
+				SDL_ConvertAudio(&audio->convert);
+				stream = audio->GetAudioBuf(audio);
+				if ( stream == NULL ) {
+					stream = audio->fake_stream;
+				}
+				SDL_memcpy(stream, audio->convert.buf,
+				               audio->convert.len_cvt);
 			}
-			SDL_memcpy(stream, audio->convert.buf,
-			               audio->convert.len_cvt);
-		}
 
-		/* Ready current buffer for play and change current buffer */
-		if ( stream != audio->fake_stream ) {
+			/* Ready current buffer for play and change current buffer */
+			if ( stream != audio->fake_stream ) {
 			audio->PlayAudio(audio);
+			}
+
+			/* Wait for an audio buffer to become available */
+			if ( stream == audio->fake_stream ) {
+				SDL_Delay((audio->spec.samples*1000)/audio->spec.freq);
+			} else {
+				audio->WaitAudio(audio);
+			}
+
+			// RG Nano
+			// check USB plugging once per second
+			if (now_USB == 0) {
+				if (--counter == 0) {
+					counter = counter_1sec;
+					if (access("/dev/dsp1", F_OK) == 0) {
+						audio->enabled = 0;
+					}
+				}
+			}
 		}
 
-		/* Wait for an audio buffer to become available */
-		if ( stream == audio->fake_stream ) {
-			SDL_Delay((audio->spec.samples*1000)/audio->spec.freq);
-		} else {
-			audio->WaitAudio(audio);
+		/* Wait for the audio to drain.. */
+		if ( audio->WaitDone ) {
+			audio->WaitDone(audio);
 		}
-	}
 
-	/* Wait for the audio to drain.. */
-	if ( audio->WaitDone ) {
-		audio->WaitDone(audio);
-	}
+		// RG Nano
+		if (quit_audio) break;
 
-	return(0);
+		// changed between speaker/headphones
+		audio->CloseAudio(audio);
+		do {
+			SDL_Delay(512); // wait 0.5s when changed
+			if (quit_audio) break;
+			now_USB ^= 1;
+			if (now_USB)	setenv("AUDIODEV","/dev/dsp1",1);
+			else		setenv("AUDIODEV","/dev/dsp",1);
+			audio->enabled = audio->OpenAudio(audio, &audio->spec)+1;
+			if (quit_audio) break;
+		} while (! audio->enabled);
+	}
+	audio->enabled = quit_audio = 0;
+	return 0;
 }
 
 static void SDL_LockAudio_Default(SDL_AudioDevice *audio)
@@ -270,17 +309,29 @@ static Uint16 SDL_ParseAudioFormat(const char *string)
 
 int SDL_AudioInit(const char *driver_name)
 {
+	// RG Nano
+	now_USB = 0;
+	char *audiodev = SDL_getenv("AUDIODEV");
+	if (audiodev != NULL) if (strcmp(audiodev,"/dev/dsp1") == 0) now_USB = 1;
+
 	SDL_AudioDevice *audio;
-	int i, idx;
+	int i = 0, idx;
 
 	/* Check to make sure we don't overwrite 'current_audio' */
 	if ( current_audio != NULL ) {
 		SDL_AudioQuit();
 	}
 
+#if SDL_AUDIO_DRIVER_PULSE
+	/* SDL 2.0 uses the name "pulseaudio", so we'll support both */
+	if ( driver_name && SDL_strcasecmp(driver_name, "pulseaudio") == 0 ) {
+		driver_name = "pulse";
+	}
+#endif /* */
+
 	/* Select the proper audio driver */
 	audio = NULL;
-	i = idx = 0;
+	idx = 0;
 #if SDL_AUDIO_DRIVER_ESD
 	if ( (driver_name == NULL) && (SDL_getenv("ESPEAKER") != NULL) ) {
 		/* Ahem, we know that if ESPEAKER is set, user probably wants
@@ -313,28 +364,18 @@ int SDL_AudioInit(const char *driver_name)
 #endif /* SDL_AUDIO_DRIVER_ESD */
 	if ( audio == NULL ) {
 		if ( driver_name != NULL ) {
-			const char *driver_attempt = driver_name;
-			while(driver_attempt != NULL && *driver_attempt != 0 && audio == NULL) {
-				const char* driver_attempt_end = SDL_strchr(driver_attempt, ',');
-				size_t driver_attempt_len = (driver_attempt_end != NULL) ? (driver_attempt_end - driver_attempt)
-				                                                         : SDL_strlen(driver_attempt);
-#if SDL_AUDIO_DRIVER_PULSE
-				/* SDL 2.0 uses the name "pulseaudio", so we'll support both */
-				if ( (driver_attempt_len == SDL_strlen("pulseaudio")) &&
-				     (SDL_strncasecmp(driver_attempt, "pulseaudio", driver_attempt_len) == 0 ) ) {
-					driver_attempt_len = SDL_strlen("pulse");
-				}
+#if 0	/* This will be replaced with a better driver selection API */
+			if ( SDL_strrchr(driver_name, ':') != NULL ) {
+				idx = atoi(SDL_strrchr(driver_name, ':')+1);
+			}
 #endif
-				for ( i=0; bootstrap[i]; ++i ) {
-					if ((driver_attempt_len == SDL_strlen(bootstrap[i]->name)) &&
-					    (SDL_strncasecmp(bootstrap[i]->name, driver_attempt, driver_attempt_len) == 0)) {
-						if ( bootstrap[i]->available() ) {
-							audio=bootstrap[i]->create(idx);
-							break;
-						}
+			for ( i=0; bootstrap[i]; ++i ) {
+				if (SDL_strcasecmp(bootstrap[i]->name, driver_name) == 0) {
+					if ( bootstrap[i]->available() ) {
+						audio=bootstrap[i]->create(idx);
+						break;
 					}
 				}
-				driver_attempt = (driver_attempt_end != NULL) ? (driver_attempt_end + 1) : NULL;
 			}
 		} else {
 			for ( i=0; bootstrap[i]; ++i ) {
@@ -348,7 +389,9 @@ int SDL_AudioInit(const char *driver_name)
 		}
 		if ( audio == NULL ) {
 			SDL_SetError("No available audio device");
-#if 0 /* Don't fail SDL_Init() if audio isn't available. SDL_OpenAudio() will handle it at that point. sigh.. */
+#if 0 /* Don't fail SDL_Init() if audio isn't available.
+         SDL_OpenAudio() will handle it at that point.  *sigh*
+       */
 			return(-1);
 #endif
 		}
@@ -361,6 +404,7 @@ int SDL_AudioInit(const char *driver_name)
 			current_audio->UnlockAudio = SDL_UnlockAudio_Default;
 		}
 	}
+
 	return(0);
 }
 
@@ -605,6 +649,7 @@ void SDL_AudioQuit(void)
 	if ( audio ) {
 		audio->enabled = 0;
 		if ( audio->thread != NULL ) {
+			quit_audio = 1;	// RG Nano
 			SDL_WaitThread(audio->thread, NULL);
 		}
 		if ( audio->mixer_lock != NULL ) {

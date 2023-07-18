@@ -33,6 +33,9 @@
 #include <pth.h>
 #endif
 
+// RG Nano
+#include	<unistd.h>
+
 /* Initialization/Cleanup routines */
 #if !SDL_JOYSTICK_DISABLED
 extern int  SDL_JoystickInit(void);
@@ -102,6 +105,10 @@ int SDL_InitSubSystem(Uint32 flags)
 #if !SDL_AUDIO_DISABLED
 	/* Initialize the audio subsystem */
 	if ( (flags & SDL_INIT_AUDIO) && !(SDL_initialized & SDL_INIT_AUDIO) ) {
+		// RG Nano
+		if (access("/dev/dsp1", F_OK) == 0) setenv("AUDIODEV","/dev/dsp1",1);
+		else setenv("AUDIODEV","/dev/dsp",1);
+
 		if ( SDL_AudioInit(SDL_getenv("SDL_AUDIODRIVER")) < 0 ) {
 			return(-1);
 		}
@@ -149,6 +156,9 @@ int SDL_InitSubSystem(Uint32 flags)
 
 int SDL_Init(Uint32 flags)
 {
+	// RG Nano
+	printf("[SDL_Init] : libSDL modified for the RG Nano.\n"); fflush(stdout);
+
 #if !SDL_THREADS_DISABLED && SDL_THREAD_PTH
 	if (!pth_init()) {
 		return -1;
