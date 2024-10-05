@@ -45,6 +45,14 @@
 
 #define NOVA_FILENAME	"\\auto\\sta_vdi.bib"
 
+/* Use shadow buffer on Nova */
+#define ENABLE_NOVA_SHADOWBUF
+
+/* Disabe gpu double buffer when using shadow buffer */
+/* This trades some amount of screen tearing for a */
+/* massive increase in performance. */
+#define DISABLE_NOVA_DOUBLEBUF	ENABLE_NOVA_SHADOWBUF
+
 /*--- ---*/
 
 static nova_xcb_t *NOVA_xcb;			/* Pointer to Nova infos */
@@ -58,18 +66,19 @@ static void XBIOS_DeleteDevice_NOVA(_THIS);
 
 static void listModes(_THIS, int actually_add);
 static void saveMode(_THIS, SDL_PixelFormat *vformat);
-static void setMode(_THIS, xbiosmode_t *new_video_mode);
+static void setMode(_THIS, const xbiosmode_t *new_video_mode);
 static void restoreMode(_THIS);
-static void vsync_NOVA(_THIS);
+static void vsync(_THIS);
 static void getScreenFormat(_THIS, int bpp, Uint32 *rmask, Uint32 *gmask, Uint32 *bmask, Uint32 *amask);
-static int getLineWidth(_THIS, xbiosmode_t *new_video_mode, int width, int bpp);
+static int getLineWidth(_THIS, const xbiosmode_t *new_video_mode, int width, int bpp);
 static void swapVbuffers(_THIS);
-static int allocVbuffers(_THIS, int num_buffers, int bufsize);
+static int allocVbuffers(_THIS, const xbiosmode_t *new_video_mode, int num_buffers, int bufsize);
 static void freeVbuffers(_THIS);
 static int setColors(_THIS, int firstcolor, int ncolors, SDL_Color *colors);
 
 /* Internal functions */
 
+static void NOVA_Vsync(_THIS);
 static void NOVA_SetMode(_THIS, int num_mode);
 static void NOVA_SetScreen(_THIS, void *screen);
 static void NOVA_SetColor(_THIS, int index, int r, int g, int b);
@@ -95,7 +104,7 @@ void SDL_XBIOS_VideoInit_Nova(_THIS, void *cookie_nova)
 	XBIOS_saveMode = saveMode;
 	XBIOS_setMode = setMode;
 	XBIOS_restoreMode = restoreMode;
-	XBIOS_vsync = vsync_NOVA;
+	XBIOS_vsync = vsync;
 	XBIOS_getScreenFormat = getScreenFormat;
 	XBIOS_getLineWidth = getLineWidth;
 	XBIOS_swapVbuffers = swapVbuffers;
@@ -133,8 +142,11 @@ static void listModes(_THIS, int actually_add)
 		modeinfo.width = width;
 		modeinfo.height = height;
 		modeinfo.depth = bpp;
+#ifdef ENABLE_NOVA_SHADOWBUF
+		modeinfo.flags = XBIOSMODE_SHADOWCOPY;
+#else
 		modeinfo.flags = 0;
-
+#endif
 		SDL_XBIOS_AddMode(this, actually_add, &modeinfo);
 	}
 }
@@ -162,7 +174,7 @@ static void saveMode(_THIS, SDL_PixelFormat *vformat)
 	this->info.video_mem = NOVA_xcb->mem_size;
 
 	XBIOS_oldvmode = NOVA_xcb->resolution;
-	XBIOS_oldvbase = NOVA_xcb->base;
+	XBIOS_oldvbase = NOVA_xcb->scr_base;
 
 	/* TODO: save palette ? */
 
@@ -170,24 +182,20 @@ static void saveMode(_THIS, SDL_PixelFormat *vformat)
 	NOVA_xcb->blnk_time = 0;
 }
 
-static void setMode(_THIS, xbiosmode_t *new_video_mode)
+static void setMode(_THIS, const xbiosmode_t *new_video_mode)
 {
 	NOVA_SetMode(this, new_video_mode->number);
 }
 
 static void restoreMode(_THIS)
 {
-	NOVA_SetScreen(this, XBIOS_oldvbase);
 	NOVA_SetMode(this, XBIOS_oldvmode);
+	NOVA_SetScreen(this, XBIOS_oldvbase);
+	NOVA_Vsync(this);
 
 	/* TODO: restore palette ? */
 
 	NOVA_xcb->blnk_time = NOVA_blnk_time;
-}
-
-static void vsync_NOVA(_THIS)
-{
-	NOVA_xcb->p_vsync();
 }
 
 static void getScreenFormat(_THIS, int bpp, Uint32 *rmask, Uint32 *gmask, Uint32 *bmask, Uint32 *amask)
@@ -220,23 +228,41 @@ static void getScreenFormat(_THIS, int bpp, Uint32 *rmask, Uint32 *gmask, Uint32
 	}
 }
 
-static int getLineWidth(_THIS, xbiosmode_t *new_video_mode, int width, int bpp)
+static int getLineWidth(_THIS, const xbiosmode_t *new_video_mode, int width, int bpp)
 {
 	return (NOVA_modes[new_video_mode->number].pitch);
 }
 
-static void swapVbuffers(_THIS)
+static void vsync(_THIS)
 {
-	NOVA_SetScreen(this, XBIOS_screens[XBIOS_fbnum]);
+	/* Don't vsync before swap unless double buffering on gpu */
+	/* Bitblit to single buffer will screen-tear regardless and we need all */
+	/* the performance we can get out of these slow cards */
+	if (XBIOS_screens[0] == XBIOS_screens[1])
+		return;
+
+	NOVA_Vsync(this);
 }
 
-static int allocVbuffers(_THIS, int num_buffers, int bufsize)
+static void swapVbuffers(_THIS)
 {
-	XBIOS_screens[0] = NOVA_xcb->base;
-	if (num_buffers>1) {
-		XBIOS_screens[1] = XBIOS_screens[0] + NOVA_xcb->scrn_sze;
+	if (XBIOS_screens[XBIOS_fbnum] != NOVA_xcb->scr_base) {
+		NOVA_SetScreen(this, XBIOS_screens[XBIOS_fbnum]);
 	}
+}
 
+static int allocVbuffers(_THIS, const xbiosmode_t *new_video_mode, int num_buffers, int bufsize)
+{
+	XBIOS_screens[0] = XBIOS_screens[1] = NOVA_xcb->base;
+#ifndef DISABLE_NOVA_DOUBLEBUF
+	if (num_buffers>1) {
+		/* Allow silent fallback to single buffering on the gpu in case */
+		/* there is not enough vram. It is quite limited on these Nova cards */
+		if (NOVA_xcb->mem_size >= (bufsize<<1)) {
+			XBIOS_screens[1] += NOVA_xcb->scrn_sze;
+		}
+	}
+#endif
 	return(1);
 }
 
@@ -255,6 +281,25 @@ static int setColors(_THIS, int firstcolor, int ncolors, SDL_Color *colors)
 	return(1);
 }
 
+static void NOVA_Vsync(_THIS)
+{
+	void *oldstack;
+
+	oldstack = (void *)Super(NULL);
+
+	__asm__ __volatile__ (
+		"movel	%0,%%a0\n\t"
+		"jsr	%%a0@"
+		: /* no return value */
+		: /* input */
+		  "g"(NOVA_xcb->p_vsync)
+		: /* clobbered registers */
+		  "d0", "d1", "d2", "a0", "a1", "cc", "memory"
+		);
+
+	SuperToUser(oldstack);
+}
+
 static void NOVA_SetMode(_THIS, int num_mode)
 {
 	void *oldstack;
@@ -266,10 +311,10 @@ static void NOVA_SetMode(_THIS, int num_mode)
 	oldstack = (void *)Super(NULL);
 
 	__asm__ __volatile__ (
-			"moveql	#0,d0\n\t"
-			"movel	%0,a0\n\t"
-			"movel	%1,a1\n\t"
-			"jsr	a1@"
+			"moveql	#0,%%d0\n\t"
+			"movel	%0,%%a0\n\t"
+			"movel	%1,%%a1\n\t"
+			"jsr	%%a1@"
 		: /* no return value */
 		: /* input */
 			"g"(&NOVA_modes[num_mode]), "g"(NOVA_xcb->p_chres)
@@ -287,9 +332,9 @@ static void NOVA_SetScreen(_THIS, void *screen)
 	oldstack = (void *)Super(NULL);
 
 	__asm__ __volatile__ (
-			"movel	%0,a0\n\t"
-			"movel	%1,a1\n\t"
-			"jsr	a1@"
+			"movel	%0,%%a0\n\t"
+			"movel	%1,%%a1\n\t"
+			"jsr	%%a1@"
 		: /* no return value */
 		: /* input */
 			"g"(screen), "g"(NOVA_xcb->p_setscr)
@@ -312,10 +357,10 @@ static void NOVA_SetColor(_THIS, int index, int r, int g, int b)
 	oldstack = (void *)Super(NULL);
 
 	__asm__ __volatile__ (
-			"movel	%0,d0\n\t"
-			"movel	%1,a0\n\t"
-			"movel	%2,a1\n\t"
-			"jsr	a1@"
+			"movel	%0,%%d0\n\t"
+			"movel	%1,%%a0\n\t"
+			"movel	%2,%%a1\n\t"
+			"jsr	%%a1@"
 		: /* no return value */
 		: /* input */
 			"g"(index), "g"(color), "g"(NOVA_xcb->p_setcol)
